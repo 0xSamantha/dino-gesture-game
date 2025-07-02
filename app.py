@@ -7,7 +7,7 @@ import itertools
 from collections import Counter
 from collections import deque
 
-import cv2 as cv  # Correct import
+import cv2 as cv
 import numpy as np
 import mediapipe as mp
 import pyautogui
@@ -107,6 +107,7 @@ def main():
     pyautogui.FAILSAFE = True
     last_action_time = 0
     debounce_interval = 0.3
+    last_hand_sign_id = None  # Track previous gesture for transition detection
 
     print("Starting Chrome Dino game in 3 seconds... Switch to the game window!")
     time.sleep(3)
@@ -158,19 +159,18 @@ def main():
                 finger_gesture_history.append(finger_gesture_id)
                 most_common_fg_id = Counter(finger_gesture_history).most_common()
 
-                if current_time - last_action_time > debounce_interval:
-                    if hand_sign_id == 0:  # Open hand -> Jump
-                        pyautogui.press('space')
-                        cv.putText(debug_image, "JUMP (Space)", (10, 120),
-                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
-                        last_action_time = current_time
-                    elif hand_sign_id == 1:  # Closed fist -> Duck
-                        pyautogui.keyDown('down')
-                        time.sleep(0.1)
-                        pyautogui.keyUp('down')
-                        cv.putText(debug_image, "DUCK (Down)", (10, 120),
-                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
-                        last_action_time = current_time
+                # Detect transition from open hand (0) to closed fist (1) for jump
+                if (last_hand_sign_id == 0 and hand_sign_id == 1 and
+                        current_time - last_action_time > debounce_interval):
+                    pyautogui.press('space')
+                    cv.putText(debug_image, "JUMP (Space)", (10, 120),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                    last_action_time = current_time
+                elif hand_sign_id == 0:
+                    cv.putText(debug_image, "RUNNING (Open Hand)", (10, 120),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+
+                last_hand_sign_id = hand_sign_id  # Update last gesture
 
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
@@ -179,7 +179,9 @@ def main():
                                             point_history_classifier_labels[most_common_fg_id[0][0]])
         else:
             point_history.append([0, 0])
-            pyautogui.keyUp('down')
+            last_hand_sign_id = None  # Reset when no hand detected
+            cv.putText(debug_image, "NO HAND DETECTED", (10, 120),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv.LINE_AA)
 
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
