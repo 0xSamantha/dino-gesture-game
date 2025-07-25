@@ -12,6 +12,8 @@ import numpy as np
 import mediapipe as mp
 import pyautogui
 import time
+import webbrowser
+import subprocess
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
@@ -20,48 +22,46 @@ from model import PointHistoryClassifier
 
 def get_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--device", type=int, default=-1)
     parser.add_argument("--width", help='cap width', type=int, default=960)
     parser.add_argument("--height", help='cap height', type=int, default=540)
-
     parser.add_argument('--use_static_image_mode', action='store_true')
-    parser.add_argument("--min_detection_confidence",
-                        help='min_detection_confidence',
-                        type=float,
-                        default=0.7)
-    parser.add_argument("--min_tracking_confidence",
-                        help='min_tracking_confidence',
-                        type=int,
-                        default=0.5)
-
+    parser.add_argument("--min_detection_confidence", help='min_detection_confidence', type=float, default=0.5)
+    parser.add_argument("--min_tracking_confidence", help='min_tracking_confidence', type=float, default=0.3)
+    parser.add_argument("--browser", type=str, default="brave", help='Browser to open game (e.g., brave, chrome)')
     args = parser.parse_args()
     return args
 
 
 def find_available_camera(max_index=5):
     for i in range(max_index):
-        cap = cv.VideoCapture(i)
+        cap = cv.VideoCapture(i, cv.CAP_AVFOUNDATION)
         if cap.isOpened():
             ret, _ = cap.read()
             cap.release()
             if ret:
-                print(f"Found available camera at index {i}")
+                print(f"Found available camera at index {i} (AVFoundation)")
                 return i
     print("No available camera found. Exiting.")
     return None
 
 
+def focus_browser_on_macos(browser_name="Brave Browser"):
+    try:
+        subprocess.run(['osascript', '-e', f'tell application "{browser_name}" to activate'])
+    except subprocess.CalledProcessError as e:
+        print(f"Error focusing browser: {e}")
+
+
 def main():
     args = get_args()
-
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
-
     use_static_image_mode = args.use_static_image_mode
     min_detection_confidence = args.min_detection_confidence
     min_tracking_confidence = args.min_tracking_confidence
+    browser = args.browser.lower()
 
     use_brect = True
 
@@ -71,9 +71,9 @@ def main():
             print("Error: No camera detected. Check connections/permissions.")
             return
 
-    cap = cv.VideoCapture(cap_device)
+    cap = cv.VideoCapture(cap_device, cv.CAP_AVFOUNDATION)
     if not cap.isOpened():
-        print(f"Error: Could not open camera at index {cap_device}.")
+        print(f"Error: Could not open camera at index {cap_device}. Try indices 0-4.")
         return
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
@@ -89,12 +89,10 @@ def main():
     keypoint_classifier = KeyPointClassifier()
     point_history_classifier = PointHistoryClassifier()
 
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
+    with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
         keypoint_classifier_labels = csv.reader(f)
         keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
-    with open('model/point_history_classifier/point_history_classifier_label.csv',
-              encoding='utf-8-sig') as f:
+    with open('model/point_history_classifier/point_history_classifier_label.csv', encoding='utf-8-sig') as f:
         point_history_classifier_labels = csv.reader(f)
         point_history_classifier_labels = [row[0] for row in point_history_classifier_labels]
 
@@ -103,21 +101,24 @@ def main():
     history_length = 16
     point_history = deque(maxlen=history_length)
     finger_gesture_history = deque(maxlen=history_length)
+    hand_sign_history = deque(maxlen=2)  # Buffer for gesture transitions
 
     pyautogui.FAILSAFE = True
     last_action_time = 0
-    debounce_interval = 0.3
-    last_hand_sign_id = None  # Track previous gesture for transition detection
+    debounce_interval = 0.2  # Jump rate: 0.2 seconds
+    last_hand_sign_id = None
+    game_started = False
+    peace_sign_start_time = None
+    fist_hold_start_time = None
+    duck_hold_duration = 0.5  # Time to hold fist for duck
+    game_url = "https://chromedino.com/"  # Brave-compatible
+    browser_name = "Brave Browser" if browser == "brave" else "Google Chrome"
 
-    print("Starting Chrome Dino game in 3 seconds... Switch to the game window!")
-    time.sleep(3)
-    pyautogui.press('space')
-
+    print("Show peace sign for 0.8 seconds to start the game...")
     mode = 0
 
     while True:
         fps = cvFpsCalc.get()
-
         key = cv.waitKey(10)
         if key == 27:  # ESC
             break
@@ -137,8 +138,7 @@ def main():
 
         current_time = time.time()
         if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
                 pre_processed_landmark_list = pre_process_landmark(landmark_list)
@@ -146,6 +146,7 @@ def main():
                 logging_csv(number, mode, pre_processed_landmark_list, pre_processed_point_history_list)
 
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                hand_sign_history.append(hand_sign_id)
                 if hand_sign_id == 2:
                     point_history.append(landmark_list[8])
                 else:
@@ -159,19 +160,70 @@ def main():
                 finger_gesture_history.append(finger_gesture_id)
                 most_common_fg_id = Counter(finger_gesture_history).most_common()
 
-                # Detect transition from open hand (0) to closed fist (1) for jump
-                if (last_hand_sign_id == 0 and hand_sign_id == 1 and
-                        current_time - last_action_time > debounce_interval):
-                    pyautogui.press('space')
-                    cv.putText(debug_image, "JUMP (Space)", (10, 120),
+                if not game_started:
+                    if hand_sign_id == 2:  # Peace sign
+                        if peace_sign_start_time is None:
+                            peace_sign_start_time = current_time
+                        elif current_time - peace_sign_start_time >= 0.8:
+                            print("Peace sign detected for 0.8 seconds. Starting countdown...")
+                            for i in range(3, 0, -1):
+                                ret, image = cap.read()
+                                if not ret:
+                                    print("Failed to capture frame from camera during countdown")
+                                    break
+                                image = cv.flip(image, 1)
+                                debug_image = copy.deepcopy(image)
+                                cv.putText(debug_image, f"Starting in {i}...", (10, 120),
+                                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv.LINE_AA)
+                                cv.imshow('Hand Gesture Recognition', debug_image)
+                                cv.waitKey(1000)
+                            webbrowser.open(game_url)
+                            time.sleep(1)
+                            focus_browser_on_macos(browser_name)
+                            print("Show peace sign again to start the game...")
+                            game_started = True
+                            peace_sign_start_time = None
+                    else:
+                        peace_sign_start_time = None
+                    cv.putText(debug_image, "Show Peace Sign to Start", (10, 120),
                                cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
-                    last_action_time = current_time
-                elif hand_sign_id == 0:
-                    cv.putText(debug_image, "RUNNING (Open Hand)", (10, 120),
-                               cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                else:
+                    fist_hold_time = current_time - fist_hold_start_time if fist_hold_start_time else 0
+                    if (len(hand_sign_history) >= 2 and hand_sign_history[-2] == 0 and hand_sign_id == 1 and
+                            current_time - last_action_time > debounce_interval):
+                        pyautogui.press('space')
+                        cv.putText(debug_image, "JUMP (Space)", (10, 120),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                        last_action_time = current_time
+                        fist_hold_start_time = None
+                    elif hand_sign_id == 2 and peace_sign_start_time is None:
+                        peace_sign_start_time = current_time
+                    elif hand_sign_id == 2 and current_time - peace_sign_start_time >= 0.8:
+                        pyautogui.press('space')
+                        cv.putText(debug_image, "GAME STARTED (Space)", (10, 120),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                        peace_sign_start_time = None
+                    elif hand_sign_id == 1:
+                        if fist_hold_start_time is None:
+                            fist_hold_start_time = current_time
+                        elif current_time - fist_hold_start_time >= duck_hold_duration and current_time - last_action_time > debounce_interval:
+                            pyautogui.keyDown('down')
+                            time.sleep(0.1)
+                            pyautogui.keyUp('down')
+                            cv.putText(debug_image, "DUCK (Down)", (10, 120),
+                                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                            last_action_time = current_time
+                            fist_hold_start_time = current_time
+                        cv.putText(debug_image, f"Fist Hold: {fist_hold_time:.2f}s", (10, 150),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1, cv.LINE_AA)
+                    elif hand_sign_id == 0:
+                        cv.putText(debug_image, "RUNNING (Open Hand)", (10, 120),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+                        fist_hold_start_time = None
+                    peace_sign_start_time = None if hand_sign_id != 2 else peace_sign_start_time
+                    fist_hold_start_time = None if hand_sign_id != 1 else fist_hold_start_time
 
-                last_hand_sign_id = hand_sign_id  # Update last gesture
-
+                last_hand_sign_id = hand_sign_id
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(debug_image, brect, handedness,
@@ -179,13 +231,15 @@ def main():
                                             point_history_classifier_labels[most_common_fg_id[0][0]])
         else:
             point_history.append([0, 0])
-            last_hand_sign_id = None  # Reset when no hand detected
+            hand_sign_history.append(None)
+            last_hand_sign_id = None
+            peace_sign_start_time = None
+            fist_hold_start_time = None
             cv.putText(debug_image, "NO HAND DETECTED", (10, 120),
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv.LINE_AA)
 
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, fps, mode, number)
-
         cv.imshow('Hand Gesture Recognition', debug_image)
 
     cap.release()
@@ -208,13 +262,11 @@ def select_mode(key, mode):
 def calc_bounding_rect(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_array = np.empty((0, 2), int)
-
     for _, landmark in enumerate(landmarks.landmark):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
         landmark_point = [np.array((landmark_x, landmark_y))]
         landmark_array = np.append(landmark_array, landmark_point, axis=0)
-
     x, y, w, h = cv.boundingRect(landmark_array)
     return [x, y, x + w, y + h]
 
@@ -222,12 +274,10 @@ def calc_bounding_rect(image, landmarks):
 def calc_landmark_list(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_point = []
-
     for _, landmark in enumerate(landmarks.landmark):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
         landmark_point.append([landmark_x, landmark_y])
-
     return landmark_point
 
 
@@ -241,10 +291,8 @@ def pre_process_landmark(landmark_list):
         temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
     temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
     max_value = max(list(map(abs, temp_landmark_list)))
-
     def normalize_(n):
         return n / max_value
-
     temp_landmark_list = list(map(normalize_, temp_landmark_list))
     return temp_landmark_list
 
@@ -322,7 +370,6 @@ def draw_landmarks(image, landmark_point):
         cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (255, 255, 255), 2)
         cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (0, 0, 0), 6)
         cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]), (255, 255, 255), 2)
-
     for index, landmark in enumerate(landmark_point):
         if index == 0:
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255), -1)
